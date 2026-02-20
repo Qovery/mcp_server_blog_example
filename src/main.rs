@@ -1,5 +1,8 @@
+use std::error::Error;
+use std::sync::LazyLock;
 use anyhow::Result;
 use futures::{stream, AsyncBufReadExt, StreamExt, TryStreamExt};
+use futures::stream::FuturesUnordered;
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::Resolver;
 use hickory_resolver::proto::rr::{RData, RecordType};
@@ -25,15 +28,17 @@ pub struct KubeServer {
     client: Client,
     tool_router: ToolRouter<Self>,
     dns_resolver: Resolver<TokioConnectionProvider>,
+    http_client: reqwest::Client,
 }
 
 #[tool_router]
 impl KubeServer {
-    pub fn new(client: Client, dns_resolver: Resolver<TokioConnectionProvider>) -> Self {
+    pub fn new(client: Client, dns_resolver: Resolver<TokioConnectionProvider>, http_client: reqwest::Client) -> Self {
         Self {
             client,
             tool_router: Self::tool_router(),
             dns_resolver,
+            http_client,
         }
     }
 
@@ -72,7 +77,7 @@ impl KubeServer {
             let timestamp = event
                 .last_timestamp
                 .as_ref()
-                .map(|t| t.0.to_rfc3339())
+                .map(|t| t.0)
                 .unwrap_or_default();
 
             output.push_str(&format!(
@@ -108,7 +113,7 @@ impl KubeServer {
             output.push_str(&format!("=== Pod: {pod_name} ===\n"));
 
             let log_params = LogParams {
-                tail_lines: Some(200),
+                tail_lines: Some(100),
                 ..Default::default()
             };
 
@@ -142,45 +147,57 @@ impl KubeServer {
     /// Fetch the status of cert-manager CRDs: CertificateRequest, Order, and Challenge across all namespaces.
     #[tool(description = "Fetch the status of cert-manager CertificateRequests, Orders, and Challenges across all namespaces. Shows name, namespace, ready condition, and reason for each resource.")]
     async fn get_certificate_status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let crds = [
+        static CRDS: LazyLock<[GroupVersionKind; 3]> = LazyLock::new(|| [
             GroupVersionKind::gvk("cert-manager.io", "v1", "CertificateRequest"),
             GroupVersionKind::gvk("acme.cert-manager.io", "v1", "Order"),
             GroupVersionKind::gvk("acme.cert-manager.io", "v1", "Challenge"),
-        ];
+        ]);
 
-        let mut output = String::new();
+        struct KubeObjectStatus {
+            namespace: String,
+            name: String,
+            status: String,
+            reason: String,
+            message: String,
+        }
 
-        for gvk in &crds {
-            let ar = ApiResource::from_gvk(gvk);
-            let api: Api<DynamicObject> = Api::all_with(self.client.clone(), &ar);
 
-            let kind = &gvk.kind;
-            output.push_str(&format!("=== {kind} ===\n"));
-
-            match api.list(&ListParams::default()).await {
-                Ok(list) => {
-                    if list.items.is_empty() {
-                        output.push_str("  No resources found.\n");
-                    }
-                    for obj in list.items {
-                        let ns = obj.metadata.namespace.as_deref().unwrap_or("unknown");
-                        let name = obj.metadata.name.as_deref().unwrap_or("unknown");
-
+        let mut api_calls: FuturesUnordered<_> = CRDS.iter().map(|gvk| {
+            let api: Api<DynamicObject> = Api::all_with(self.client.clone(), &ApiResource::from_gvk(&gvk));
+            async move {
+                let kind = gvk.kind.clone();
+                match api.list(&ListParams::default()).await {
+                    Ok(result) => {
                         // Extract status.conditions to find Ready/Valid condition
-                        let (status_str, reason, message) =
-                            extract_condition(&obj, kind);
-
-                        output.push_str(&format!(
-                            "  {ns}/{name}: status={status_str} reason={reason} message={message}\n"
-                        ));
+                        let ret = result.items.into_iter().map(move |obj| {
+                            let (status_str, reason, message) = extract_condition(&obj);
+                            KubeObjectStatus {
+                                namespace: obj.metadata.namespace.unwrap_or_default(),
+                                name: obj.metadata.name.unwrap_or_default(),
+                                status: status_str,
+                                reason,
+                                message,
+                            }});
+                        Ok((kind, ret))
                     }
-                }
-                Err(e) => {
-                    output.push_str(&format!("  Failed to list: {e}\n"));
+                    Err(e) => Err((kind, e))
                 }
             }
+        }).collect();
 
-            output.push('\n');
+
+        // Render
+        let mut output = String::new();
+        while let Some(object_status) =api_calls.next().await {
+            match object_status {
+                Err((kind, e)) => output.push_str(&format!("  Failed to list: {kind} due to {e}\n")),
+                Ok((kind, objs)) => {
+                    output.push_str(&format!("=== {kind} ===\n"));
+                    objs.for_each(|status| {
+                        output.push_str(&format!("  {}/{}: status={} reason={} message={}\n", status.namespace, status.name, status.status, status.reason, status.message))
+                    })
+                }
+            }
         }
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
@@ -237,69 +254,23 @@ impl KubeServer {
         Parameters(params): Parameters<HttpCheckParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let url = &params.url;
-        let uri: http::Uri = url.parse().map_err(|e: http::uri::InvalidUri| rmcp::ErrorData {
-            code: ErrorCode::INVALID_PARAMS,
-            message: format!("Invalid URL '{url}': {e}").into(),
-            data: None,
-        })?;
 
-        let scheme = uri.scheme_str().unwrap_or("https");
-        let host = uri.host().ok_or_else(|| rmcp::ErrorData {
-            code: ErrorCode::INVALID_PARAMS,
-            message: format!("No host in URL '{url}'").into(),
-            data: None,
-        })?;
-        let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
-        let authority = format!("{host}:{port}");
-
-        let tls = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .map_err(|e| rmcp::ErrorData {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: format!("Failed to load TLS roots: {e}").into(),
-                data: None,
-            })?
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build();
-
-        let client =
-            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-                .build(tls);
-
-        let req = http::Request::builder()
-            .method(http::Method::GET)
-            .uri(url.as_str())
-            .header(http::header::HOST, host)
-            .body(http_body_util::Empty::<bytes::Bytes>::new())
-            .map_err(|e| rmcp::ErrorData {
-                code: ErrorCode::INTERNAL_ERROR,
-                message: format!("Failed to build request: {e}").into(),
-                data: None,
-            })?;
-
-        match client.request(req).await {
+        let msg = match self.http_client.get(url.as_str()).send().await {
             Ok(resp) => {
                 let status = resp.status();
-                let msg = if status.is_success() {
+                if status.is_success() {
                     format!("Success: {url} returned HTTP {status}")
                 } else {
                     format!("HTTP error: {url} returned HTTP {status}")
-                };
-                Ok(CallToolResult::success(vec![Content::text(msg)]))
+                }
             }
             Err(e) => {
-                let msg = format!("Request to {url} failed: {e}");
-                // Check for more specific causes
-                let detail = if e.is_connect() {
-                    format!("{msg} (connection failed to {authority})")
-                } else {
-                    msg
-                };
-                Ok(CallToolResult::success(vec![Content::text(detail)]))
+                format!("Request to {url} failed: {:?}", e.source())
             }
-        }
+        };
+
+
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 }
 
@@ -317,7 +288,7 @@ struct HttpCheckParams {
 
 /// Extract the most relevant condition from a cert-manager dynamic object.
 /// CertificateRequest uses "Ready", Order uses "Ready", Challenge uses "Ready" as well.
-fn extract_condition(obj: &DynamicObject, _kind: &str) -> (String, String, String) {
+fn extract_condition(obj: &DynamicObject) -> (String, String, String) {
     let unknown = || {
         (
             "Unknown".to_string(),
@@ -426,7 +397,10 @@ async fn main() -> Result<()> {
 
     let client = Client::try_default().await?;
     let dns_resolver = Resolver::builder_tokio()?.build();
-    let service = KubeServer::new(client, dns_resolver).serve(stdio()).await?;
+    let http_client = reqwest::Client::builder().tls_backend_rustls()
+        .build()?;
+
+    let service = KubeServer::new(client, dns_resolver, http_client).serve(stdio()).await?;
     service.waiting().await?;
 
     Ok(())
