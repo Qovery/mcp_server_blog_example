@@ -12,31 +12,31 @@ use kube::{
     api::{ApiResource, DynamicObject, GroupVersionKind, ListParams, LogParams},
     Client,
 };
-use rmcp::{
-    ServerHandler, ServiceExt,
-    handler::server::router::tool::ToolRouter,
-    handler::server::wrapper::Parameters,
-    model::*,
-    schemars, tool, tool_handler, tool_router,
-    transport::stdio,
-};
+use rmcp::{ServerHandler, ServiceExt, handler::server::router::tool::ToolRouter, handler::server::wrapper::Parameters, model::*, schemars, tool, tool_handler, tool_router, transport::stdio, prompt, prompt_handler, prompt_router};
+use rmcp::handler::server::router::prompt::PromptRouter;
 use tokio_rustls::rustls;
 use tracing_subscriber::{self, EnvFilter};
+use rmcp::service::RequestContext;
+use rmcp::RoleServer;
 
 #[derive(Clone)]
 pub struct KubeServer {
     client: Client,
     tool_router: ToolRouter<Self>,
+    prompt_router: PromptRouter<Self>,
     dns_resolver: Resolver<TokioConnectionProvider>,
     http_client: reqwest::Client,
 }
 
+
 #[tool_router]
+#[prompt_router]
 impl KubeServer {
     pub fn new(client: Client, dns_resolver: Resolver<TokioConnectionProvider>, http_client: reqwest::Client) -> Self {
         Self {
             client,
             tool_router: Self::tool_router(),
+            prompt_router: Self::prompt_router(),
             dns_resolver,
             http_client,
         }
@@ -44,7 +44,7 @@ impl KubeServer {
 
     /// Fetch Kubernetes events from a namespace.
     /// Returns the most recent events with their type, reason, message, and involved object.
-    #[tool(description = "Fetch Kubernetes events from a namespace. Returns recent events with type, reason, message, and involved object.")]
+    #[tool(description = "Fetch Kubernetes events from a namespace. Returns recent events with type, reason, message, and involved object.", annotations(read_only_hint=true))]
     async fn get_kube_events(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let events: Api<Event> = Api::all(self.client.clone());
         let lp = ListParams::default();
@@ -92,62 +92,11 @@ impl KubeServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    /// Fetch logs from cert-manager pods.
-    /// Returns the logs from all cert-manager pods in the cert-manager namespace.
-    #[tool(description = "Fetch logs from cert-manager pods in the cert-manager namespace. Returns recent log lines from all cert-manager pods.")]
-    async fn get_cert_manager_logs(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let pods: Api<k8s_openapi::api::core::v1::Pod> =
-            Api::namespaced(self.client.clone(), "cert-manager");
-        let lp = ListParams::default().labels("app.kubernetes.io/instance=cert-manager");
-
-        let pod_list = pods.list(&lp).await.map_err(|e| rmcp::ErrorData {
-            code: ErrorCode::INTERNAL_ERROR,
-            message: format!("Failed to list cert-manager pods: {e}").into(),
-            data: None,
-        })?;
-
-        let mut output = String::new();
-
-        for pod in pod_list.items {
-            let pod_name = pod.metadata.name.as_deref().unwrap_or("unknown");
-            output.push_str(&format!("=== Pod: {pod_name} ===\n"));
-
-            let log_params = LogParams {
-                tail_lines: Some(100),
-                ..Default::default()
-            };
-
-            match pods.log_stream(pod_name, &log_params).await {
-                Ok(stream) => {
-                    let mut lines = stream.lines();
-                    while let Some(line) = lines.try_next().await.map_err(|e| rmcp::ErrorData {
-                        code: ErrorCode::INTERNAL_ERROR,
-                        message: format!("Failed to read log stream for {pod_name}: {e}").into(),
-                        data: None,
-                    })? {
-                        output.push_str(&line);
-                        output.push('\n');
-                    }
-                }
-                Err(e) => {
-                    output.push_str(&format!("Failed to get logs: {e}\n"));
-                }
-            }
-
-            output.push('\n');
-        }
-
-        if output.is_empty() {
-            output = "No cert-manager pods found.".to_string();
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
     /// Fetch the status of cert-manager CRDs: CertificateRequest, Order, and Challenge across all namespaces.
-    #[tool(description = "Fetch the status of cert-manager CertificateRequests, Orders, and Challenges across all namespaces. Shows name, namespace, ready condition, and reason for each resource.")]
+    #[tool(description = "Fetch the status of cert-manager CertificateRequests, Orders, and Challenges across all namespaces. Shows name, namespace, ready condition, and reason for each resource.", annotations(read_only_hint=true))]
     async fn get_certificate_status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        static CRDS: LazyLock<[GroupVersionKind; 3]> = LazyLock::new(|| [
+        static CRDS: LazyLock<[GroupVersionKind; 4]> = LazyLock::new(|| [
+            GroupVersionKind::gvk("cert-manager.io", "v1", "Certificate"),
             GroupVersionKind::gvk("cert-manager.io", "v1", "CertificateRequest"),
             GroupVersionKind::gvk("acme.cert-manager.io", "v1", "Order"),
             GroupVersionKind::gvk("acme.cert-manager.io", "v1", "Challenge"),
@@ -204,7 +153,7 @@ impl KubeServer {
     }
 
     /// Query DNS records for a domain, following the CNAME chain and returning leaf A/AAAA records.
-    #[tool(description = "Query DNS for a domain. Returns the full CNAME chain and the leaf A/AAAA records.")]
+    #[tool(description = "Query DNS for a domain. Returns the full CNAME chain and the leaf A/AAAA records.", annotations(read_only_hint=true))]
     async fn dns_lookup(
         &self,
         Parameters(params): Parameters<DnsLookupParams>,
@@ -248,7 +197,7 @@ impl KubeServer {
     }
 
     /// Make an HTTP(S) request to a given URL and report success or failure reason.
-    #[tool(description = "Make an HTTP GET request to a URL and report whether it succeeds (with status code) or fails (with the error reason). Supports both HTTP and HTTPS.")]
+    #[tool(description = "Make an HTTP GET request to a URL and report whether it succeeds (with status code) or fails (with the error reason). Supports both HTTP and HTTPS.", annotations(read_only_hint=true))]
     async fn http_check(
         &self,
         Parameters(params): Parameters<HttpCheckParams>,
@@ -272,7 +221,82 @@ impl KubeServer {
 
         Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
+
+    /// Fetch logs from cert-manager pods.
+    /// Returns the logs from all cert-manager pods in the cert-manager namespace.
+    #[tool(description = "Fetch logs from cert-manager pods in the cert-manager namespace. Returns recent log lines from all cert-manager pods.", annotations(read_only_hint=true))]
+    async fn get_cert_manager_logs(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let pods: Api<k8s_openapi::api::core::v1::Pod> =
+            Api::namespaced(self.client.clone(), "cert-manager");
+        let lp = ListParams::default().labels("app.kubernetes.io/instance=cert-manager");
+
+        let pod_list = pods.list(&lp).await.map_err(|e| rmcp::ErrorData {
+            code: ErrorCode::INTERNAL_ERROR,
+            message: format!("Failed to list cert-manager pods: {e}").into(),
+            data: None,
+        })?;
+
+        let mut output = String::new();
+
+        for pod in pod_list.items {
+            let pod_name = pod.metadata.name.as_deref().unwrap_or("unknown");
+            output.push_str(&format!("=== Pod: {pod_name} ===\n"));
+
+            let log_params = LogParams {
+                tail_lines: Some(100),
+                ..Default::default()
+            };
+
+            match pods.log_stream(pod_name, &log_params).await {
+                Ok(stream) => {
+                    let mut lines = stream.lines();
+                    while let Some(line) = lines.try_next().await.map_err(|e| rmcp::ErrorData {
+                        code: ErrorCode::INTERNAL_ERROR,
+                        message: format!("Failed to read log stream for {pod_name}: {e}").into(),
+                        data: None,
+                    })? {
+                        output.push_str(&line);
+                        output.push('\n');
+                    }
+                }
+                Err(e) => {
+                    output.push_str(&format!("Failed to get logs: {e}\n"));
+                }
+            }
+
+            output.push('\n');
+        }
+
+        if output.is_empty() {
+            output = "No cert-manager pods found.".to_string();
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+
+    #[prompt(name = "investigate_certificate_issue", description = "Prompt to investigate certificate issue.")]
+    async fn investigate_certificate_issue(&self, Parameters(args): Parameters<DnsLookupParams>) -> Result<Vec<PromptMessage>, rmcp::ErrorData> {
+        Ok(
+            vec![
+                PromptMessage {
+                    role: PromptMessageRole::Assistant,
+                    content: PromptMessageContent::Text {
+                        text: "You are an SRE and Kubernetes expert. Your task is to investigate certificate issues and provide recommendations for resolution. Use http check, DNS lookup, Kube events and certificate inspection tools to diagnose and propose resolution".to_string(),
+                    }
+                },
+                PromptMessage {
+                    role: PromptMessageRole::User,
+                    content: PromptMessageContent::Text {
+                        text: format!("Investigate the certificate issue for this domain: {}", args.domain),
+                    }
+                },
+            ]
+        )
+    }
+
 }
+
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DnsLookupParams {
@@ -362,12 +386,16 @@ fn extract_condition(obj: &DynamicObject) -> (String, String, String) {
     unknown()
 }
 
+#[prompt_handler]
 #[tool_handler]
 impl ServerHandler for KubeServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            protocol_version: ProtocolVersion::V_2025_06_18,
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build(),
             server_info: Implementation {
                 name: "kube-mcp-server".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -376,10 +404,7 @@ impl ServerHandler for KubeServer {
                 icons: None,
                 website_url: None,
             },
-            instructions: Some(
-                "Kubernetes MCP server providing tools to fetch cluster events and cert-manager logs."
-                    .into(),
-            ),
+            instructions: Some("Kubernetes MCP server providing tools to fetch cluster events and cert-manager logs.".into()),
         }
     }
 }
