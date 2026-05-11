@@ -1,23 +1,26 @@
-use std::error::Error;
-use std::sync::LazyLock;
 use anyhow::Result;
-use futures::{stream, AsyncBufReadExt, StreamExt, TryStreamExt};
 use futures::stream::FuturesUnordered;
-use hickory_resolver::name_server::TokioConnectionProvider;
+use futures::{AsyncBufReadExt, StreamExt, TryStreamExt, stream};
 use hickory_resolver::Resolver;
+use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::proto::rr::{RData, RecordType};
 use k8s_openapi::api::core::v1::Event;
 use kube::{
-    Api,
+    Api, Client,
     api::{ApiResource, DynamicObject, GroupVersionKind, ListParams, LogParams},
-    Client,
 };
-use rmcp::{ServerHandler, ServiceExt, handler::server::router::tool::ToolRouter, handler::server::wrapper::Parameters, model::*, schemars, tool, tool_handler, tool_router, transport::stdio, prompt, prompt_handler, prompt_router};
+use rmcp::RoleServer;
 use rmcp::handler::server::router::prompt::PromptRouter;
+use rmcp::service::RequestContext;
+use rmcp::{
+    ServerHandler, ServiceExt, handler::server::router::tool::ToolRouter,
+    handler::server::wrapper::Parameters, model::*, prompt, prompt_handler, prompt_router,
+    schemars, tool, tool_handler, tool_router, transport::stdio,
+};
+use std::error::Error;
+use std::sync::LazyLock;
 use tokio_rustls::rustls;
 use tracing_subscriber::{self, EnvFilter};
-use rmcp::service::RequestContext;
-use rmcp::RoleServer;
 
 #[derive(Clone)]
 pub struct KubeServer {
@@ -28,11 +31,14 @@ pub struct KubeServer {
     http_client: reqwest::Client,
 }
 
-
 #[tool_router]
 #[prompt_router]
 impl KubeServer {
-    pub fn new(client: Client, dns_resolver: Resolver<TokioConnectionProvider>, http_client: reqwest::Client) -> Self {
+    pub fn new(
+        client: Client,
+        dns_resolver: Resolver<TokioConnectionProvider>,
+        http_client: reqwest::Client,
+    ) -> Self {
         Self {
             client,
             tool_router: Self::tool_router(),
@@ -44,7 +50,10 @@ impl KubeServer {
 
     /// Fetch Kubernetes events from a namespace.
     /// Returns the most recent events with their type, reason, message, and involved object.
-    #[tool(description = "Fetch Kubernetes events from a namespace. Returns recent events with type, reason, message, and involved object.", annotations(read_only_hint=true))]
+    #[tool(
+        description = "Fetch Kubernetes events from a namespace. Returns recent events with type, reason, message, and involved object.",
+        annotations(read_only_hint = true)
+    )]
     async fn get_kube_events(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let events: Api<Event> = Api::all(self.client.clone());
         let lp = ListParams::default();
@@ -56,21 +65,9 @@ impl KubeServer {
 
         let mut output = String::new();
         for event in event_list.items {
-            let namespace = event
-                .metadata
-                .namespace
-                .as_deref()
-                .unwrap_or("unknown");
-            let kind = event
-                .involved_object
-                .kind
-                .as_deref()
-                .unwrap_or("unknown");
-            let name = event
-                .involved_object
-                .name
-                .as_deref()
-                .unwrap_or("unknown");
+            let namespace = event.metadata.namespace.as_deref().unwrap_or("unknown");
+            let kind = event.involved_object.kind.as_deref().unwrap_or("unknown");
+            let name = event.involved_object.name.as_deref().unwrap_or("unknown");
             let reason = event.reason.as_deref().unwrap_or("unknown");
             let message = event.message.as_deref().unwrap_or("");
             let event_type = event.type_.as_deref().unwrap_or("Normal");
@@ -93,14 +90,19 @@ impl KubeServer {
     }
 
     /// Fetch the status of cert-manager CRDs: CertificateRequest, Order, and Challenge across all namespaces.
-    #[tool(description = "Fetch the status of cert-manager CertificateRequests, Orders, and Challenges across all namespaces. Shows name, namespace, ready condition, and reason for each resource.", annotations(read_only_hint=true))]
+    #[tool(
+        description = "Fetch the status of cert-manager CertificateRequests, Orders, and Challenges across all namespaces. Shows name, namespace, ready condition, and reason for each resource.",
+        annotations(read_only_hint = true)
+    )]
     async fn get_certificate_status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        static CRDS: LazyLock<[GroupVersionKind; 4]> = LazyLock::new(|| [
-            GroupVersionKind::gvk("cert-manager.io", "v1", "Certificate"),
-            GroupVersionKind::gvk("cert-manager.io", "v1", "CertificateRequest"),
-            GroupVersionKind::gvk("acme.cert-manager.io", "v1", "Order"),
-            GroupVersionKind::gvk("acme.cert-manager.io", "v1", "Challenge"),
-        ]);
+        static CRDS: LazyLock<[GroupVersionKind; 4]> = LazyLock::new(|| {
+            [
+                GroupVersionKind::gvk("cert-manager.io", "v1", "Certificate"),
+                GroupVersionKind::gvk("cert-manager.io", "v1", "CertificateRequest"),
+                GroupVersionKind::gvk("acme.cert-manager.io", "v1", "Order"),
+                GroupVersionKind::gvk("acme.cert-manager.io", "v1", "Challenge"),
+            ]
+        });
 
         struct KubeObjectStatus {
             namespace: String,
@@ -110,40 +112,52 @@ impl KubeServer {
             message: String,
         }
 
-
-        let mut api_calls: FuturesUnordered<_> = CRDS.iter().map(|gvk| {
-            let api: Api<DynamicObject> = Api::all_with(self.client.clone(), &ApiResource::from_gvk(&gvk));
-            async move {
-                let kind = gvk.kind.clone();
-                match api.list(&ListParams::default()).await {
-                    Ok(result) => {
-                        // Extract status.conditions to find Ready/Valid condition
-                        let ret = result.items.into_iter().map(move |obj| {
-                            let (status_str, reason, message) = extract_condition(&obj);
-                            KubeObjectStatus {
-                                namespace: obj.metadata.namespace.unwrap_or_default(),
-                                name: obj.metadata.name.unwrap_or_default(),
-                                status: status_str,
-                                reason,
-                                message,
-                            }});
-                        Ok((kind, ret))
+        let mut api_calls: FuturesUnordered<_> = CRDS
+            .iter()
+            .map(|gvk| {
+                let api: Api<DynamicObject> =
+                    Api::all_with(self.client.clone(), &ApiResource::from_gvk(gvk));
+                async move {
+                    let kind = gvk.kind.clone();
+                    match api.list(&ListParams::default()).await {
+                        Ok(result) => {
+                            // Extract status.conditions to find Ready/Valid condition
+                            let ret = result.items.into_iter().map(move |obj| {
+                                let (status_str, reason, message) = extract_condition(&obj);
+                                KubeObjectStatus {
+                                    namespace: obj.metadata.namespace.unwrap_or_default(),
+                                    name: obj.metadata.name.unwrap_or_default(),
+                                    status: status_str,
+                                    reason,
+                                    message,
+                                }
+                            });
+                            Ok((kind, ret))
+                        }
+                        Err(e) => Err((kind, e)),
                     }
-                    Err(e) => Err((kind, e))
                 }
-            }
-        }).collect();
-
+            })
+            .collect();
 
         // Render
         let mut output = String::new();
-        while let Some(object_status) =api_calls.next().await {
+        while let Some(object_status) = api_calls.next().await {
             match object_status {
-                Err((kind, e)) => output.push_str(&format!("  Failed to list: {kind} due to {e}\n")),
+                Err((kind, e)) => {
+                    output.push_str(&format!("  Failed to list: {kind} due to {e}\n"))
+                }
                 Ok((kind, objs)) => {
                     output.push_str(&format!("=== {kind} ===\n"));
                     objs.for_each(|status| {
-                        output.push_str(&format!("  {}/{}: status={} reason={} message={}\n", status.namespace, status.name, status.status, status.reason, status.message))
+                        output.push_str(&format!(
+                            "  {}/{}: status={} reason={} message={}\n",
+                            status.namespace,
+                            status.name,
+                            status.status,
+                            status.reason,
+                            status.message
+                        ))
                     })
                 }
             }
@@ -153,43 +167,63 @@ impl KubeServer {
     }
 
     /// Query DNS records for a domain, following the CNAME chain and returning leaf A/AAAA records.
-    #[tool(description = "Query DNS for a domain. Returns the full CNAME chain and the leaf A/AAAA records.", annotations(read_only_hint=true))]
+    #[tool(
+        description = "Query DNS for a domain. Returns the full CNAME chain and the leaf A/AAAA records.",
+        annotations(read_only_hint = true)
+    )]
     async fn dns_lookup(
         &self,
         Parameters(params): Parameters<DnsLookupParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-
         let domain = params.domain.clone();
         let mut output = format!("DNS lookup for: {domain}\n\n");
 
         // Follow the CNAME chain
-        let cname_resolver = stream::unfold((domain, self.dns_resolver.clone()), move |(domain, resolver)| async move {
-            let lookup = resolver.lookup(&domain, RecordType::CNAME).await.ok()?;
-            let cname = lookup.into_iter().find_map(|rdata| if let RData::CNAME(cname) = rdata { Some(cname) } else { None })?;
-            let target_domain = cname.0.to_utf8();
-            Some(((domain, target_domain.clone()), (target_domain, resolver)))
-        });
+        let cname_resolver = stream::unfold(
+            (domain, self.dns_resolver.clone()),
+            move |(domain, resolver)| async move {
+                let lookup = resolver.lookup(&domain, RecordType::CNAME).await.ok()?;
+                let cname = lookup.into_iter().find_map(|rdata| {
+                    if let RData::CNAME(cname) = rdata {
+                        Some(cname)
+                    } else {
+                        None
+                    }
+                })?;
+                let target_domain = cname.0.to_utf8();
+                Some(((domain, target_domain.clone()), (target_domain, resolver)))
+            },
+        );
 
         let mut cname_chain: Vec<(String, String)> = cname_resolver.collect().await;
         output.push_str("CNAME chain:\n");
-        cname_chain.iter().for_each(|(from, to)| output.push_str(&format!("  {from} -> {to}\n")) );
+        cname_chain
+            .iter()
+            .for_each(|(from, to)| output.push_str(&format!("  {from} -> {to}\n")));
         if cname_chain.is_empty() {
             output.push_str("none -> direct record\n");
         }
         output.push('\n');
 
         // Resolve A records on the final target
-        let leaf_domain = cname_chain.pop().map(|(_, leaf)| leaf).unwrap_or(params.domain);
+        let leaf_domain = cname_chain
+            .pop()
+            .map(|(_, leaf)| leaf)
+            .unwrap_or(params.domain);
         output.push_str(&format!("A records for {leaf_domain}:\n"));
         match self.dns_resolver.ipv4_lookup(leaf_domain.as_str()).await {
-            Ok(lookup) => lookup.into_iter().for_each(|a| output.push_str(&format!("  {}\n", a.0)) ),
+            Ok(lookup) => lookup
+                .into_iter()
+                .for_each(|a| output.push_str(&format!("  {}\n", a.0))),
             Err(e) => output.push_str(&format!("  (none: {e})\n")),
         }
 
         // Resolve AAAA records on the final target
         output.push_str(&format!("\nAAAA records for {leaf_domain}:\n"));
         match self.dns_resolver.ipv6_lookup(leaf_domain.as_str()).await {
-            Ok(lookup) => lookup.into_iter().for_each(|a| output.push_str(&format!("  {}\n", a.0)) ),
+            Ok(lookup) => lookup
+                .into_iter()
+                .for_each(|a| output.push_str(&format!("  {}\n", a.0))),
             Err(e) => output.push_str(&format!("  (none: {e})\n")),
         }
 
@@ -197,7 +231,10 @@ impl KubeServer {
     }
 
     /// Make an HTTP(S) request to a given URL and report success or failure reason.
-    #[tool(description = "Make an HTTP GET request to a URL and report whether it succeeds (with status code) or fails (with the error reason). Supports both HTTP and HTTPS.", annotations(read_only_hint=true))]
+    #[tool(
+        description = "Make an HTTP GET request to a URL and report whether it succeeds (with status code) or fails (with the error reason). Supports both HTTP and HTTPS.",
+        annotations(read_only_hint = true)
+    )]
     async fn http_check(
         &self,
         Parameters(params): Parameters<HttpCheckParams>,
@@ -218,13 +255,15 @@ impl KubeServer {
             }
         };
 
-
         Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     /// Fetch logs from cert-manager pods.
     /// Returns the logs from all cert-manager pods in the cert-manager namespace.
-    #[tool(description = "Fetch logs from cert-manager pods in the cert-manager namespace. Returns recent log lines from all cert-manager pods.", annotations(read_only_hint=true))]
+    #[tool(
+        description = "Fetch logs from cert-manager pods in the cert-manager namespace. Returns recent log lines from all cert-manager pods.",
+        annotations(read_only_hint = true)
+    )]
     async fn get_cert_manager_logs(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let pods: Api<k8s_openapi::api::core::v1::Pod> =
             Api::namespaced(self.client.clone(), "cert-manager");
@@ -274,29 +313,29 @@ impl KubeServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-
-    #[prompt(name = "investigate_certificate_issue", description = "Prompt to investigate certificate issue.")]
-    async fn investigate_certificate_issue(&self, Parameters(args): Parameters<DnsLookupParams>) -> Result<Vec<PromptMessage>, rmcp::ErrorData> {
-        Ok(
-            vec![
-                PromptMessage {
-                    role: PromptMessageRole::Assistant,
-                    content: PromptMessageContent::Text {
-                        text: "You are an SRE and Kubernetes expert. Your task is to investigate certificate issues and provide recommendations for resolution. Use http check, DNS lookup, Kube events and certificate inspection tools to diagnose and propose resolution".to_string(),
-                    }
-                },
-                PromptMessage {
-                    role: PromptMessageRole::User,
-                    content: PromptMessageContent::Text {
-                        text: format!("Investigate the certificate issue for this domain: {}", args.domain),
-                    }
-                },
-            ]
-        )
+    #[prompt(
+        name = "investigate_certificate_issue",
+        description = "Prompt to investigate certificate issue."
+    )]
+    async fn investigate_certificate_issue(
+        &self,
+        Parameters(args): Parameters<DnsLookupParams>,
+    ) -> Result<Vec<PromptMessage>, rmcp::ErrorData> {
+        Ok(vec![
+            PromptMessage::new_text(
+                PromptMessageRole::Assistant,
+                "You are an SRE and Kubernetes expert. Your task is to investigate certificate issues and provide recommendations for resolution. Use http check, DNS lookup, Kube events and certificate inspection tools to diagnose and propose resolution",
+            ),
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!(
+                    "Investigate the certificate issue for this domain: {}",
+                    args.domain
+                ),
+            ),
+        ])
     }
-
 }
-
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct DnsLookupParams {
@@ -313,13 +352,7 @@ struct HttpCheckParams {
 /// Extract the most relevant condition from a cert-manager dynamic object.
 /// CertificateRequest uses "Ready", Order uses "Ready", Challenge uses "Ready" as well.
 fn extract_condition(obj: &DynamicObject) -> (String, String, String) {
-    let unknown = || {
-        (
-            "Unknown".to_string(),
-            "".to_string(),
-            "".to_string(),
-        )
-    };
+    let unknown = || ("Unknown".to_string(), "".to_string(), "".to_string());
 
     let status = match obj.data.get("status") {
         Some(s) => s,
@@ -331,10 +364,7 @@ fn extract_condition(obj: &DynamicObject) -> (String, String, String) {
         None => {
             // For Order, the status might just have a "state" field
             if let Some(state) = status.get("state").and_then(|s| s.as_str()) {
-                let reason = status
-                    .get("reason")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("");
+                let reason = status.get("reason").and_then(|r| r.as_str()).unwrap_or("");
                 return (state.to_string(), reason.to_string(), "".to_string());
             }
             return unknown();
@@ -363,7 +393,10 @@ fn extract_condition(obj: &DynamicObject) -> (String, String, String) {
 
     // Fallback: return the first condition
     if let Some(condition) = conditions.first() {
-        let ctype = condition.get("type").and_then(|t| t.as_str()).unwrap_or("Unknown");
+        let ctype = condition
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("Unknown");
         let cstatus = condition
             .get("status")
             .and_then(|s| s.as_str())
@@ -390,28 +423,28 @@ fn extract_condition(obj: &DynamicObject) -> (String, String, String) {
 #[tool_handler]
 impl ServerHandler for KubeServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2025_06_18,
-            capabilities: ServerCapabilities::builder()
+        ServerInfo::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
                 .build(),
-            server_info: Implementation {
-                name: "kube-mcp-server".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                title: None,
-                description: None,
-                icons: None,
-                website_url: None,
-            },
-            instructions: Some("Kubernetes MCP server providing tools to fetch cluster events and cert-manager logs.".into()),
-        }
+        )
+        .with_protocol_version(ProtocolVersion::V_2025_06_18)
+        .with_server_info(Implementation::new(
+            "kube-mcp-server",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(
+            "Kubernetes MCP server providing tools to fetch cluster events and cert-manager logs.",
+        )
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .with_writer(std::io::stderr)
@@ -422,10 +455,11 @@ async fn main() -> Result<()> {
 
     let client = Client::try_default().await?;
     let dns_resolver = Resolver::builder_tokio()?.build();
-    let http_client = reqwest::Client::builder().tls_backend_rustls()
-        .build()?;
+    let http_client = reqwest::Client::builder().tls_backend_rustls().build()?;
 
-    let service = KubeServer::new(client, dns_resolver, http_client).serve(stdio()).await?;
+    let service = KubeServer::new(client, dns_resolver, http_client)
+        .serve(stdio())
+        .await?;
     service.waiting().await?;
 
     Ok(())
