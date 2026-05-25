@@ -2,7 +2,7 @@ use anyhow::Result;
 use futures::stream::FuturesUnordered;
 use futures::{AsyncBufReadExt, StreamExt, TryStreamExt, stream};
 use hickory_resolver::Resolver;
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::{RData, RecordType};
 use k8s_openapi::api::core::v1::Event;
 use kube::{
@@ -27,7 +27,7 @@ pub struct KubeServer {
     client: Client,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
-    dns_resolver: Resolver<TokioConnectionProvider>,
+    dns_resolver: Resolver<TokioRuntimeProvider>,
     http_client: reqwest::Client,
 }
 
@@ -36,7 +36,7 @@ pub struct KubeServer {
 impl KubeServer {
     pub fn new(
         client: Client,
-        dns_resolver: Resolver<TokioConnectionProvider>,
+        dns_resolver: Resolver<TokioRuntimeProvider>,
         http_client: reqwest::Client,
     ) -> Self {
         Self {
@@ -183,9 +183,9 @@ impl KubeServer {
             (domain, self.dns_resolver.clone()),
             move |(domain, resolver)| async move {
                 let lookup = resolver.lookup(&domain, RecordType::CNAME).await.ok()?;
-                let cname = lookup.into_iter().find_map(|rdata| {
-                    if let RData::CNAME(cname) = rdata {
-                        Some(cname)
+                let cname = lookup.answers().iter().find_map(|record| {
+                    if let RData::CNAME(cname) = &record.data {
+                        Some(cname.clone())
                     } else {
                         None
                     }
@@ -213,7 +213,9 @@ impl KubeServer {
         output.push_str(&format!("A records for {leaf_domain}:\n"));
         match self.dns_resolver.ipv4_lookup(leaf_domain.as_str()).await {
             Ok(lookup) => lookup
-                .into_iter()
+                .answers()
+                .iter()
+                .filter_map(|r| if let RData::A(a) = r.data { Some(a) } else { None })
                 .for_each(|a| output.push_str(&format!("  {}\n", a.0))),
             Err(e) => output.push_str(&format!("  (none: {e})\n")),
         }
@@ -222,7 +224,9 @@ impl KubeServer {
         output.push_str(&format!("\nAAAA records for {leaf_domain}:\n"));
         match self.dns_resolver.ipv6_lookup(leaf_domain.as_str()).await {
             Ok(lookup) => lookup
-                .into_iter()
+                .answers()
+                .iter()
+                .filter_map(|r| if let RData::AAAA(a) = r.data { Some(a) } else { None })
                 .for_each(|a| output.push_str(&format!("  {}\n", a.0))),
             Err(e) => output.push_str(&format!("  (none: {e})\n")),
         }
@@ -454,7 +458,7 @@ async fn main() -> Result<()> {
     tracing::info!("Starting kube MCP server");
 
     let client = Client::try_default().await?;
-    let dns_resolver = Resolver::builder_tokio()?.build();
+    let dns_resolver = Resolver::builder_tokio()?.build()?;
     let http_client = reqwest::Client::builder().tls_backend_rustls().build()?;
 
     let service = KubeServer::new(client, dns_resolver, http_client)
